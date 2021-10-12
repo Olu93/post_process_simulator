@@ -21,13 +21,22 @@ import pandas as pd
 from typing import Iterable, List, Dict
 
 
-class Modes(Enum):
+class ListTokenizer(Tokenizer):
+    def tokenize(self, text: List[str]) -> List[Token]:
+        return [Token(t) for t in text]
+
+    def batch_tokenize(self, texts: List[List[str]]) -> List[List[Token]]:
+        return [self.tokenize(sent) for sent in texts]
+
+
+class TaskModes(Enum):
     SIMPLE = auto()
     EXTENSIVE = auto()
+    EXTENSIVE_RANDOM = auto()
     FINAL_OUTCOME = auto()
 
 
-class Dataset(Enum):
+class DatasetModes(Enum):
     TRAIN = auto()
     VAL = auto()
     TEST = auto()
@@ -44,21 +53,22 @@ class AbstractProcessLogReader(DatasetReader):
     activityId: str = None
     _vocab: dict = None
     vocabulary: Vocabulary = Vocabulary.empty()
-    modes: Modes = Modes.SIMPLE
+    modes: TaskModes = TaskModes.SIMPLE
+    padding_token: str = "<PAD>"
 
     def __init__(self,
                  data_path: str,
                  caseId: str = 'case:concept:name',
                  activityId: str = 'concept:name',
                  debug=False,
-                 mode: Modes = Modes.SIMPLE,
+                 mode: TaskModes = TaskModes.SIMPLE,
                  tokenizer: Tokenizer = None,
-                 token_indexers: Dict[str, TokenIndexer] = None,
+                 token_indexers: TokenIndexer = None,
                  max_tokens: int = None,
                  **kwargs) -> None:
         super().__init__(**kwargs)
-        self.tokenizer = tokenizer or WhitespaceTokenizer()
-        self.token_indexers = token_indexers or {"tokens": SingleIdTokenIndexer()}
+        self.tokenizer = tokenizer or ListTokenizer()
+        self.token_indexers = {"tokens": token_indexers or SingleIdTokenIndexer()}
         self.max_tokens = None
         self.debug = debug
         self.mode = mode
@@ -103,29 +113,43 @@ class AbstractProcessLogReader(DatasetReader):
     def compute_sequences(self):
         grouped_traces = list(self.data.groupby(by=self.caseId))
 
-        self._traces = {
-            idx: self.tokenizer.tokenize(" ".join(list(df[self.activityId].values)))
-            for idx, df in grouped_traces
-        }
+        self._traces = {idx: self.tokenizer.tokenize(list(df[self.activityId].values)) for idx, df in grouped_traces}
 
         self.instantiate_dataset()
 
     def instantiate_dataset(self):
-        if self.mode == Modes.SIMPLE:
+        if self.mode == TaskModes.SIMPLE:
             self.traces = self._traces.values()
-            self.train, self.val, self.test = self._train_test_split(self.traces)
+            self.trace_data, self.test = self._train_test_split(self.traces)
+            self.train, self.val = self.train_val_split(self.trace_data)
 
-        if self.mode == Modes.EXTENSIVE:
-            self.traces = ((4 - to) * [Token("<PAD>")] + tr[0:to] for tr in self._traces.values()
-                           for to in range(2,
-                                           len(tr) + 1) if len(tr) > 2)
+        if self.mode == TaskModes.EXTENSIVE:
+            self.traces = (tr[0:end] for tr in self._traces.values() for end in range(2, len(tr) + 1) if len(tr) > 1)
 
-        if self.mode == Modes.FINAL_OUTCOME:
-            self.traces = ((4 - to) * [Token("<PAD>")] + tr[0:to] + tr[-1] for tr in self._traces.values()
-                           for to in range(2, len(tr)) if len(tr) > 2)
+        if self.mode == TaskModes.EXTENSIVE_RANDOM:
+            tmp_traces = (tr[random.randint(0,
+                                            len(tr) - 1):] for tr in self._traces.values()
+                          for sample in self._heuristic_sample_size(tr) if len(tr) > 1)
+            self.traces = (tr[:random.randint(2, len(tr))] for tr in tmp_traces if len(tr) > 1)
+
+        if self.mode == TaskModes.FINAL_OUTCOME:
+            self.traces = (tr[0:end] + tr[-1] for tr in self._traces.values() for end in range(2, len(tr))
+                           if len(tr) > 1)
+
+        # if self.mode == TaskModes.EXTENSIVE:
+        #     self.traces = ((4 - to) * [Token(self.padding_token)] + tr[0:to] for tr in self._traces.values()
+        #                    for to in range(2,
+        #                                    len(tr) + 1) if len(tr) > 2)
+
+        # if self.mode == TaskModes.FINAL_OUTCOME:
+        #     self.traces = ((4 - to) * [Token(self.padding_token)] + tr[0:to] + tr[-1] for tr in self._traces.values()
+        #                    for to in range(2, len(tr)) if len(tr) > 2)
 
         self.trace_data, self.test = self._train_test_split(self.traces)
         self.train, self.val = self.train_val_split(self.trace_data)
+
+    def _heuristic_sample_size(self, sequence):
+        return range((len(sequence)**2 + len(sequence)) // 4)
 
     def _train_test_split(self, traces):
         traces = list(traces)
@@ -149,12 +173,11 @@ class AbstractProcessLogReader(DatasetReader):
         val_traces = traces[:len_val_traces]
         return train_traces, val_traces
 
-    # Not necessary just add token
     def register_vocabulary(self):
-
-        self.vocabulary.add_tokens_to_namespace(list(self.data[self.activityId].unique()))
-        self.vocabulary.add_token_to_namespace("<PAD>")  
-        self.max_tokens = self.vocabulary.get_vocab_size() # Entirely wrong even
+        all_unique_tokens = list(self.data[self.activityId].unique()) + [self.padding_token]
+        self.vocabulary.add_tokens_to_namespace(all_unique_tokens)
+        self.vocabulary.add_tokens_to_namespace(all_unique_tokens, namespace="labels")
+        self.max_tokens = self.vocabulary.get_vocab_size()
 
     @property
     def tokens(self) -> List[str]:
@@ -184,12 +207,12 @@ class AbstractProcessLogReader(DatasetReader):
 
     def _read(self, file_path: str) -> Iterable[Instance]:
 
-        if file_path == Dataset.TRAIN:
+        if file_path == DatasetModes.TRAIN:
             for line in self.train:
                 instance = AbstractProcessLogReader.text_to_instance(line, self.token_indexers, self.max_tokens)
                 yield instance
 
-        if file_path == Dataset.VAL:
+        if file_path == DatasetModes.VAL:
             for line in self.val:
                 instance = AbstractProcessLogReader.text_to_instance(line, self.token_indexers, self.max_tokens)
                 yield instance
